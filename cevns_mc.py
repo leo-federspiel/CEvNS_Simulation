@@ -328,6 +328,6 @@ if __name__ == "__main__":
         print(f"Mean E_R:           {E_R_s.mean():.3e} eV")
         print(f"E_R range:          [{E_R_s.min():.3e}, {E_R_s.max():.3e}] eV")
     else:
-        print("No events accepted — the flux has no support above the kinematic threshold for this material.")
+        print("No events accepted: the flux has no support above the kinematic threshold for this material.")
 
     plot_results(source, mat, E_v_s, E_R_s, Ev_min)
