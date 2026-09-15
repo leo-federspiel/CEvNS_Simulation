@@ -2,25 +2,31 @@
 CEνNS event rate calculator
 Helm form factor, flux interpolated in log-log space between digitized points.
 
-    rate = n_targets * ∫ dE_ν φ(E_ν) ∫_{E_thresh}^{E_R^max} dE_R dσ/dE_R
+    rate = n_targets * ∫ dE_ν φ(E_ν) ∫_{threshold}^{E_R^max} dE_R dσ/dE_R
 
 Units: energies in eV, flux in cm^-2 s^-1 eV^-1, cross sections in cm^2.
 Sources: solar_nuclear | geo | reactor | cnb
 Materials: Ar | Xe | Ge
+
+Detector settings can be passed as flags or entered at the prompts:
+    python cevns.py --source reactor --material Ge --mass 1000 --threshold 50
 """
 
+import argparse
 import bisect
 import math
+from dataclasses import dataclass
 
 # --- constants ---
 G_F    = 1.1664e-23   # Fermi constant [eV^-2]
 N_A    = 6.02214e23   # [mol^-1]
 hbar_c = 197.327e6    # [eV·fm]
 to_cm2 = 3.8938e-10   # (ħc)^2 [eV^2·cm^2], converts eV^-2 -> cm^2
+s      = 0.9          # Helm skin thickness [fm]
 
-s        = 0.9   # Helm skin thickness [fm]
-M_det    = 23    # detector mass [kg]
-E_thresh = 100   # recoil threshold [eV]
+# --- detector defaults (override with --mass / --threshold or at the prompt) ---
+DEFAULT_MASS_KG      = 23
+DEFAULT_THRESHOLD_EV = 100
 
 # --- flux data (log10 E [eV], log10 flux [cm^-2 s^-1 eV^-1]) ---
 FLUX_DATA = {
@@ -142,6 +148,25 @@ MATERIALS = {
 }
 
 
+@dataclass(frozen=True)
+class Detector:
+    """Target material, active mass [kg], and nuclear recoil threshold [eV]."""
+    material: str
+    mass_kg: float = DEFAULT_MASS_KG
+    threshold_eV: float = DEFAULT_THRESHOLD_EV
+
+    def __post_init__(self):
+        if self.material not in MATERIALS:
+            raise ValueError(f"unknown material {self.material!r}, choose from {' | '.join(MATERIALS)}")
+        if not self.mass_kg > 0:
+            raise ValueError("detector mass must be positive")
+        if not self.threshold_eV > 0:
+            raise ValueError("recoil threshold must be positive (the form factor is undefined at zero recoil)")
+
+    def describe(self):
+        return f"{self.mass_kg:g} kg {self.material}, {self.threshold_eV:g} eV threshold"
+
+
 # --- flux handling ---
 
 def load_spectrum(source):
@@ -169,13 +194,13 @@ def flux_at(E_v, logE, logF):
 
 # --- physics ---
 
-def nucleus(mat):
+def nucleus(det):
     """Returns (m [eV], weak charge Q_W, Helm radius R [fm], number of target nuclei)."""
-    p = MATERIALS[mat]
+    p = MATERIALS[det.material]
     A = p["N"] + p["Z"]
     Q_W = p["N"] - 0.072 * p["Z"]
     R = math.sqrt((1.2 * A**(1/3))**2 - 5 * s**2)
-    n_targets = M_det / p["M"] * N_A
+    n_targets = det.mass_kg / p["M"] * N_A
     return p["m"], Q_W, R, n_targets
 
 
@@ -191,7 +216,7 @@ def E_R_max(E_v, m):
     return 2 * E_v**2 / (m + 2 * E_v)
 
 
-def E_v_min(m, thresh=E_thresh):
+def E_v_min(m, thresh):
     """Smallest neutrino energy [eV] whose maximum recoil reaches thresh."""
     return (thresh + math.sqrt(thresh**2 + 2 * thresh * m)) / 2
 
@@ -206,25 +231,25 @@ def ds_dE(E_v, E_R, m, Q_W, R):
     return G_F**2 * m / (4 * math.pi) * Q_W**2 * kin * F**2 * to_cm2
 
 
-def sigma_above_threshold(E_v, m, Q_W, R, n_pts=101):
-    """∫ dσ/dE_R dE_R from E_thresh to E_R^max [cm^2], Simpson's rule."""
+def sigma_above_threshold(E_v, m, Q_W, R, thresh, n_pts=101):
+    """∫ dσ/dE_R dE_R from thresh to E_R^max [cm^2], Simpson's rule."""
     hi = E_R_max(E_v, m)
-    if hi <= E_thresh:
+    if hi <= thresh:
         return 0.0
     n = n_pts if n_pts % 2 else n_pts + 1
-    h = (hi - E_thresh) / (n - 1)
-    total = ds_dE(E_v, E_thresh, m, Q_W, R) + ds_dE(E_v, hi, m, Q_W, R)
+    h = (hi - thresh) / (n - 1)
+    total = ds_dE(E_v, thresh, m, Q_W, R) + ds_dE(E_v, hi, m, Q_W, R)
     for k in range(1, n - 1):
-        total += (4 if k % 2 else 2) * ds_dE(E_v, E_thresh + k * h, m, Q_W, R)
+        total += (4 if k % 2 else 2) * ds_dE(E_v, thresh + k * h, m, Q_W, R)
     return total * h / 3
 
 
-def event_rate(source, mat, n_grid=400):
-    """Expected detected events per second above E_thresh."""
+def event_rate(source, det, n_grid=400):
+    """Expected detected events per second for detector det."""
     logE, logF = load_spectrum(source)
-    m, Q_W, R, n_targets = nucleus(mat)
+    m, Q_W, R, n_targets = nucleus(det)
 
-    lo = max(logE[0], math.log10(E_v_min(m)))
+    lo = max(logE[0], math.log10(E_v_min(m, det.threshold_eV)))
     hi = logE[-1]
     if lo >= hi:
         return 0.0
@@ -235,7 +260,8 @@ def event_rate(source, mat, n_grid=400):
     prev = None
     for k in range(n_grid):
         E = 10 ** (lo + k * du)
-        f = flux_at(E, logE, logF) * sigma_above_threshold(E, m, Q_W, R) * E * math.log(10)
+        sig = sigma_above_threshold(E, m, Q_W, R, det.threshold_eV)
+        f = flux_at(E, logE, logF) * sig * E * math.log(10)
         if prev is not None:
             rate += (prev + f) * du / 2
         prev = f
@@ -243,11 +269,69 @@ def event_rate(source, mat, n_grid=400):
     return rate * n_targets
 
 
-if __name__ == "__main__":
-    source = input("Neutrino source (solar_nuclear | geo | reactor | cnb): ").strip()
-    mat    = input("Target material (Ar | Xe | Ge): ").strip()
+# --- command line ---
 
-    r = event_rate(source, mat)
+def positive_float(text):
+    x = float(text)
+    if not (x > 0 and math.isfinite(x)):
+        raise ValueError(f"{text!r} is not a positive number")
+    return x
+
+
+def positive_int(text):
+    x = int(text)
+    if x <= 0:
+        raise ValueError(f"{text!r} is not a positive integer")
+    return x
+
+
+def prompt(label, cast=str, default=None, choices=None):
+    """Ask on stdin until the answer parses. Empty input takes the default."""
+    if choices:
+        label = f"{label} ({' | '.join(choices)})"
+    if default is not None:
+        label = f"{label} [default {default}]"
+    while True:
+        raw = input(f"{label}: ").strip()
+        if not raw and default is not None:
+            return cast(str(default))
+        try:
+            value = cast(raw)
+        except ValueError:
+            print(f"  couldn't use {raw!r}, try again")
+            continue
+        if choices and value not in choices:
+            print(f"  pick one of {' | '.join(choices)}")
+            continue
+        return value
+
+
+def add_detector_args(parser):
+    parser.add_argument("--source", choices=list(FLUX_DATA), help="neutrino source")
+    parser.add_argument("--material", choices=list(MATERIALS), help="target material")
+    parser.add_argument("--mass", type=positive_float,
+                        help=f"detector mass in kg (default {DEFAULT_MASS_KG})")
+    parser.add_argument("--threshold", type=positive_float,
+                        help=f"nuclear recoil threshold in eV (default {DEFAULT_THRESHOLD_EV})")
+
+
+def resolve_detector_args(args):
+    """Use the flags that were given and prompt for the rest. Returns (source, Detector)."""
+    source = args.source or prompt("Neutrino source", choices=list(FLUX_DATA))
+    material = args.material or prompt("Target material", choices=list(MATERIALS))
+    mass = args.mass or prompt("Detector mass in kg", positive_float, DEFAULT_MASS_KG)
+    threshold = args.threshold or prompt("Recoil threshold in eV", positive_float, DEFAULT_THRESHOLD_EV)
+    return source, Detector(material, mass, threshold)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CEνNS event rate for a neutrino source and detector.")
+    add_detector_args(parser)
+    source, det = resolve_detector_args(parser.parse_args())
+
+    r = event_rate(source, det)
+    print(f"\n{source} neutrinos on {det.describe()}")
+    print(f"Minimum E_ν for detectable recoil: {E_v_min(nucleus(det)[0], det.threshold_eV):.3e} eV")
     print(f"Event rate: {r:.4e} events/s  ({r * 3.156e7:.3g} events/yr)")
     if r > 0:
         print(f"Mean time between events: {1/r:.4e} s")
