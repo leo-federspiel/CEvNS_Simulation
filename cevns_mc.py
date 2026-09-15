@@ -2,11 +2,15 @@
 CEνNS Monte Carlo simulation
 Samples neutrino energies of detected events from φ(E_ν)·σ(E_ν) via inverse CDF,
 then samples recoil energies from dσ/dE_R via rejection sampling.
-Physics and flux data are imported from cevns.py.
+Physics, flux data, and detector settings are imported from cevns.py.
 Sources: solar_nuclear | geo | reactor | cnb
 Materials: Ar | Xe | Ge
+
+Detector settings can be passed as flags or entered at the prompts:
+    python cevns_mc.py --source solar_nuclear --material Xe --mass 1000 --threshold 50 --samples 20000
 """
 
+import argparse
 import math
 import random
 from pathlib import Path
@@ -15,34 +19,38 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from cevns import (
-    E_thresh, E_R_max, E_v_min, ds_dE, flux_at, load_spectrum,
-    nucleus, sigma_above_threshold,
+    E_R_max, E_v_min, ds_dE, flux_at, load_spectrum, nucleus, sigma_above_threshold,
+    add_detector_args, positive_int, prompt, resolve_detector_args,
 )
+
+DEFAULT_SAMPLES = 50_000
 
 
 # --- sampling ---
 
-def build_event_cdf(source, m, Q_W, R, n_grid=400):
+def build_event_cdf(source, det, n_grid=400):
     """
     Piecewise-linear CDF of the neutrino energies behind detected events,
-    p(E_ν) ∝ φ(E_ν) σ(E_ν), where σ counts only recoils above threshold.
-    Returns (E_v grid, unnormalized weights, cdf), or None if no event is possible.
+    p(E_ν) ∝ φ(E_ν) σ(E_ν), where σ counts only recoils above det's threshold.
+    Returns (E_v grid, unnormalized weights, cdf, event rate [1/s]),
+    or None if no event is possible.
     """
     logE, logF = load_spectrum(source)
-    lo = max(logE[0], math.log10(E_v_min(m)))
+    m, Q_W, R, n_targets = nucleus(det)
+    lo = max(logE[0], math.log10(E_v_min(m, det.threshold_eV)))
     hi = logE[-1]
     if lo >= hi:
         return None
 
     E_v = np.logspace(lo, hi, n_grid)
-    w = np.array([flux_at(E, logE, logF) * sigma_above_threshold(E, m, Q_W, R)
+    w = np.array([flux_at(E, logE, logF) * sigma_above_threshold(E, m, Q_W, R, det.threshold_eV)
                   for E in E_v])
 
     areas = 0.5 * (w[:-1] + w[1:]) * np.diff(E_v)
     cdf = np.concatenate([[0.0], np.cumsum(areas)])
     if cdf[-1] <= 0:
         return None
-    return E_v, w, cdf / cdf[-1]
+    return E_v, w, cdf / cdf[-1], cdf[-1] * n_targets
 
 
 def sample_E_v(E_v, cdf):
@@ -54,23 +62,23 @@ def sample_E_v(E_v, cdf):
     return E_v[idx] + t * (E_v[idx + 1] - E_v[idx])
 
 
-def sample_E_R(E_v, m, Q_W, R, n_env=40, max_tries=300):
+def sample_E_R(E_v, m, Q_W, R, thresh, n_env=40, max_tries=300):
     """
-    Draw one recoil energy via rejection sampling over [E_thresh, E_R^max].
+    Draw one recoil energy via rejection sampling over [thresh, E_R^max].
     Builds a coarse envelope grid to handle non-monotone ds_dE.
     Returns (E_R, proposals used); E_R is None if no recoil was accepted.
     """
     hi = E_R_max(E_v, m)
-    if hi <= E_thresh:
+    if hi <= thresh:
         return None, 0
 
-    grid  = np.linspace(E_thresh, hi, n_env)
+    grid  = np.linspace(thresh, hi, n_env)
     f_max = max(ds_dE(E_v, er, m, Q_W, R) for er in grid)
     if f_max <= 0:
         return None, 0
 
     for tries in range(1, max_tries + 1):
-        E_R = random.uniform(E_thresh, hi)
+        E_R = random.uniform(thresh, hi)
         if random.random() < ds_dE(E_v, E_R, m, Q_W, R) / f_max:
             return E_R, tries
     return None, max_tries
@@ -78,15 +86,16 @@ def sample_E_R(E_v, m, Q_W, R, n_env=40, max_tries=300):
 
 # --- simulation ---
 
-def run_mc(source, mat, n_samples=50_000):
+def run_mc(source, det, n_samples=DEFAULT_SAMPLES):
     """
-    Returns (E_v samples, E_R samples, (E_v grid, weights) or None, total proposals).
+    Returns (E_v samples, E_R samples, (E_v grid, weights) or None,
+    total proposals, event rate [1/s]).
     """
-    m, Q_W, R, _ = nucleus(mat)
-    built = build_event_cdf(source, m, Q_W, R)
+    built = build_event_cdf(source, det)
     if built is None:
-        return np.array([]), np.array([]), None, 0
-    E_v_grid, weights, cdf = built
+        return np.array([]), np.array([]), None, 0, 0.0
+    E_v_grid, weights, cdf, rate = built
+    m, Q_W, R, _ = nucleus(det)
 
     sampled_E_v = []
     sampled_E_R = []
@@ -94,20 +103,21 @@ def run_mc(source, mat, n_samples=50_000):
 
     for _ in range(n_samples):
         Ev = sample_E_v(E_v_grid, cdf)
-        E_R, tries = sample_E_R(Ev, m, Q_W, R)
+        E_R, tries = sample_E_R(Ev, m, Q_W, R, det.threshold_eV)
         proposals += tries
         if E_R is not None:
             sampled_E_v.append(Ev)
             sampled_E_R.append(E_R)
 
-    return np.array(sampled_E_v), np.array(sampled_E_R), (E_v_grid, weights), proposals
+    return (np.array(sampled_E_v), np.array(sampled_E_R),
+            (E_v_grid, weights), proposals, rate)
 
 
-def plot_results(source, mat, E_v_samples, E_R_samples, spectrum, Ev_min):
+def plot_results(source, det, E_v_samples, E_R_samples, spectrum, Ev_min):
     n = len(E_v_samples)
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     fig.suptitle(
-        f"CEνNS Monte Carlo  —  {source} / {mat}   ({n:,} accepted events)",
+        f"CEνNS Monte Carlo, {source} on {det.describe()}   ({n:,} accepted events)",
         fontsize=12,
     )
 
@@ -133,7 +143,8 @@ def plot_results(source, mat, E_v_samples, E_R_samples, spectrum, Ev_min):
     ax = axes[1]
     if n > 0:
         ax.hist(E_R_samples, bins=50, color="darkorange", edgecolor="none", density=True)
-    ax.axvline(E_thresh, color="k", lw=1, linestyle=":", label=f"threshold = {E_thresh} eV")
+    ax.axvline(det.threshold_eV, color="k", lw=1, linestyle=":",
+               label=f"threshold = {det.threshold_eV:g} eV")
     ax.set_xlabel("E_R [eV]")
     ax.set_ylabel("density")
     ax.set_title("Nuclear recoil energies")
@@ -152,27 +163,34 @@ def plot_results(source, mat, E_v_samples, E_R_samples, spectrum, Ev_min):
     ax.set_title("E_ν vs E_R joint distribution")
 
     plt.tight_layout()
-    out = Path(__file__).resolve().with_name(f"cevns_mc_{source}_{mat}.png")
+    name = f"cevns_mc_{source}_{det.material}_{det.threshold_eV:g}eV.png"
+    out = Path(__file__).resolve().with_name(name)
     plt.savefig(out, dpi=150, bbox_inches="tight")
     print(f"Plot saved: {out}")
     plt.show()
 
 
 if __name__ == "__main__":
-    source = input("Neutrino source (solar_nuclear | geo | reactor | cnb): ").strip()
-    mat    = input("Target material (Ar | Xe | Ge): ").strip()
-    n      = int(input("Number of MC samples [default 50000]: ").strip() or 50000)
+    parser = argparse.ArgumentParser(description="CEνNS Monte Carlo for a neutrino source and detector.")
+    add_detector_args(parser)
+    parser.add_argument("--samples", type=positive_int,
+                        help=f"number of MC samples (default {DEFAULT_SAMPLES})")
+    args = parser.parse_args()
 
-    m = nucleus(mat)[0]
-    Ev_min = E_v_min(m)
+    source, det = resolve_detector_args(args)
+    n = args.samples or prompt("Number of MC samples", positive_int, DEFAULT_SAMPLES)
+
+    Ev_min = E_v_min(nucleus(det)[0], det.threshold_eV)
+    print(f"\n{source} neutrinos on {det.describe()}")
     print(f"Minimum E_ν for detectable recoil: {Ev_min:.3e} eV  (log10 = {math.log10(Ev_min):.2f})")
 
     print(f"Running {n:,} samples...")
-    E_v_s, E_R_s, spectrum, proposals = run_mc(source, mat, n_samples=n)
+    E_v_s, E_R_s, spectrum, proposals, rate = run_mc(source, det, n_samples=n)
 
     if spectrum is None:
-        print("No events possible: the flux has no support above the kinematic threshold for this material.")
+        print("No events possible: the flux has no support above the kinematic threshold for this detector.")
     else:
+        print(f"Expected events: {rate * 3.156e7:.3g} per year")
         print(f"Accepted: {len(E_v_s):,} of {n:,}")
         if proposals > 0:
             print(f"Rejection sampler efficiency: {100 * len(E_v_s) / proposals:.1f}%")
@@ -180,4 +198,4 @@ if __name__ == "__main__":
             print(f"Mean E_ν (sampled): {E_v_s.mean():.3e} eV")
             print(f"Mean E_R:           {E_R_s.mean():.3e} eV")
             print(f"E_R range:          [{E_R_s.min():.3e}, {E_R_s.max():.3e}] eV")
-        plot_results(source, mat, E_v_s, E_R_s, spectrum, Ev_min)
+        plot_results(source, det, E_v_s, E_R_s, spectrum, Ev_min)
