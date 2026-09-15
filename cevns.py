@@ -1,23 +1,28 @@
 """
 CEνNS event rate calculator
-Helm form factor, trapezoidal integration over digitized flux spectra.
+Helm form factor, flux interpolated in log-log space between digitized points.
+
+    rate = n_targets * ∫ dE_ν φ(E_ν) ∫_{E_thresh}^{E_R^max} dE_R dσ/dE_R
+
+Units: energies in eV, flux in cm^-2 s^-1 eV^-1, cross sections in cm^2.
 Sources: solar_nuclear | geo | reactor | cnb
 Materials: Ar | Xe | Ge
 """
 
+import bisect
 import math
 
 # --- constants ---
-G_F   = 1.166e13    # Fermi constant [eV^-2]
-N_A   = 6.02214e23
-hbar_c = 197.3e6    # eV·fm
-to_cm2 = 3.894e-52  # natural units -> cm^2
+G_F    = 1.1664e-23   # Fermi constant [eV^-2]
+N_A    = 6.02214e23   # [mol^-1]
+hbar_c = 197.327e6    # [eV·fm]
+to_cm2 = 3.8938e-10   # (ħc)^2 [eV^2·cm^2], converts eV^-2 -> cm^2
 
-s    = 0.9   # Helm skin thickness [fm]
-M_det = 23   # detector mass [kg]
-E_thresh = 100  # recoil threshold [eV]
+s        = 0.9   # Helm skin thickness [fm]
+M_det    = 23    # detector mass [kg]
+E_thresh = 100   # recoil threshold [eV]
 
-# --- flux data (log10 scale) ---
+# --- flux data (log10 E [eV], log10 flux [cm^-2 s^-1 eV^-1]) ---
 FLUX_DATA = {
     "solar_nuclear": {
         "E_log": [
@@ -137,6 +142,43 @@ MATERIALS = {
 }
 
 
+# --- flux handling ---
+
+def load_spectrum(source):
+    """Digitized (log10 E, log10 flux) points, sorted by energy."""
+    d = FLUX_DATA[source]
+    pts = sorted(zip(d["E_log"], d["flux_log"]))
+    return [p[0] for p in pts], [p[1] for p in pts]
+
+
+def flux_at(E_v, logE, logF):
+    """
+    Flux at E_v [cm^-2 s^-1 eV^-1], linear interpolation in log-log space
+    (power law between digitized points). Zero outside the digitized range.
+    """
+    x = math.log10(E_v)
+    if x < logE[0] or x > logE[-1]:
+        return 0.0
+    i = min(bisect.bisect_right(logE, x) - 1, len(logE) - 2)
+    x0, x1 = logE[i], logE[i + 1]
+    if x1 == x0:
+        return 10 ** logF[i]
+    t = (x - x0) / (x1 - x0)
+    return 10 ** (logF[i] + t * (logF[i + 1] - logF[i]))
+
+
+# --- physics ---
+
+def nucleus(mat):
+    """Returns (m [eV], weak charge Q_W, Helm radius R [fm], number of target nuclei)."""
+    p = MATERIALS[mat]
+    A = p["N"] + p["Z"]
+    Q_W = p["N"] - 0.072 * p["Z"]
+    R = math.sqrt((1.2 * A**(1/3))**2 - 5 * s**2)
+    n_targets = M_det / p["M"] * N_A
+    return p["m"], Q_W, R, n_targets
+
+
 def helm_F(q, R):
     """Helm form factor F(q); q in fm^-1, R in fm."""
     qR = q * R
@@ -144,41 +186,61 @@ def helm_F(q, R):
     return 3 * j1_qR * math.exp(-(q * s)**2 / 2) / qR
 
 
+def E_R_max(E_v, m):
+    """Maximum nuclear recoil energy [eV] for neutrino energy E_v."""
+    return 2 * E_v**2 / (m + 2 * E_v)
+
+
+def E_v_min(m, thresh=E_thresh):
+    """Smallest neutrino energy [eV] whose maximum recoil reaches thresh."""
+    return (thresh + math.sqrt(thresh**2 + 2 * thresh * m)) / 2
+
+
 def ds_dE(E_v, E_R, m, Q_W, R):
-    """dσ/dE_R [cm^2/eV] via standard CEνNS formula."""
+    """dσ/dE_R [cm^2/eV] = G_F^2 m / (4π) * Q_W^2 * (1 - m E_R / 2E_ν^2) * F^2."""
     q   = math.sqrt(2 * m * E_R) / hbar_c   # fm^-1
     F   = helm_F(q, R)
     kin = 1 - m * E_R / (2 * E_v**2)
-    return G_F**2 / (4 * math.pi) * kin * Q_W**2 * F**2 * to_cm2
+    if kin <= 0:
+        return 0.0
+    return G_F**2 * m / (4 * math.pi) * Q_W**2 * kin * F**2 * to_cm2
 
 
-def event_rate(source, mat):
-    d = FLUX_DATA[source]
-    p = MATERIALS[mat]
+def sigma_above_threshold(E_v, m, Q_W, R, n_pts=101):
+    """∫ dσ/dE_R dE_R from E_thresh to E_R^max [cm^2], Simpson's rule."""
+    hi = E_R_max(E_v, m)
+    if hi <= E_thresh:
+        return 0.0
+    n = n_pts if n_pts % 2 else n_pts + 1
+    h = (hi - E_thresh) / (n - 1)
+    total = ds_dE(E_v, E_thresh, m, Q_W, R) + ds_dE(E_v, hi, m, Q_W, R)
+    for k in range(1, n - 1):
+        total += (4 if k % 2 else 2) * ds_dE(E_v, E_thresh + k * h, m, Q_W, R)
+    return total * h / 3
 
-    E_v   = [10**x for x in d["E_log"]]
-    flux  = [10**x for x in d["flux_log"]]
 
-    m, N, Z, M = p["m"], p["N"], p["Z"], p["M"]
-    A    = N + Z
-    Q_W  = N - 0.072 * Z
-    R    = math.sqrt((1.2 * A**(1/3))**2 - 5 * s**2)
-    n    = M_det / M * N_A
+def event_rate(source, mat, n_grid=400):
+    """Expected detected events per second above E_thresh."""
+    logE, logF = load_spectrum(source)
+    m, Q_W, R, n_targets = nucleus(mat)
 
+    lo = max(logE[0], math.log10(E_v_min(m)))
+    hi = logE[-1]
+    if lo >= hi:
+        return 0.0
+
+    # integrate over u = log10(E_ν), with dE_ν = E_ν ln(10) du
+    du = (hi - lo) / (n_grid - 1)
     rate = 0.0
-    E_R_prev = ds_prev = None
+    prev = None
+    for k in range(n_grid):
+        E = 10 ** (lo + k * du)
+        f = flux_at(E, logE, logF) * sigma_above_threshold(E, m, Q_W, R) * E * math.log(10)
+        if prev is not None:
+            rate += (prev + f) * du / 2
+        prev = f
 
-    for i, (Ev, phi) in enumerate(zip(E_v, flux)):
-        E_R = 2 * Ev**2 / (m + 2 * Ev) / 2   # E_R^max / 2
-        sig = ds_dE(Ev, E_R, m, Q_W, R)
-
-        if i > 0 and E_R > E_thresh:
-            rate += phi * (sig + ds_prev) * (E_R - E_R_prev) / 2 * n
-
-        E_R_prev = E_R
-        ds_prev  = sig
-
-    return rate
+    return rate * n_targets
 
 
 if __name__ == "__main__":
@@ -186,6 +248,6 @@ if __name__ == "__main__":
     mat    = input("Target material (Ar | Xe | Ge): ").strip()
 
     r = event_rate(source, mat)
-    print(f"Event rate: {r:.4e} events/s")
+    print(f"Event rate: {r:.4e} events/s  ({r * 3.156e7:.3g} events/yr)")
     if r > 0:
         print(f"Mean time between events: {1/r:.4e} s")
